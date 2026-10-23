@@ -40,45 +40,59 @@ Snorlax is a browser-first, Slack-inspired team collaboration app built with an 
 stateDiagram-v2
     [*] --> Unauthenticated
 
-    state "Authentication & Workspace" as AuthWorkspace {
-        Unauthenticated --> Authenticating : sign in / sign up
-        Authenticating --> Authenticated : session established
-        Authenticated --> Unauthenticated : sign out / token expired
+    state "Auth & Navigation Domain" as AuthWorkspace {
+        Unauthenticated --> Authenticating : sign in / sign up / invite token
+        Authenticating --> Authenticated : session established & token persisted
+        Authenticated --> TokenRefreshed : silent TOKEN_REFRESHED (realtime auth sync)
+        TokenRefreshed --> Authenticated : active session maintained
+        Authenticated --> Unauthenticated : explicit sign out / terminal refresh failure
 
         [*] --> SelectWorkspace
-        SelectWorkspace --> ActiveWorkspace : select workspace / invite token
+        SelectWorkspace --> ActiveWorkspace : select workspace / consume invite
         ActiveWorkspace --> SelectChannel : choose channel (public/private)
     }
 
-    state "Realtime Connection" as RealtimeState {
+    state "Realtime Connection Domain" as RealtimeState {
         [*] --> Disconnected
         Disconnected --> Connecting : initialize Supabase client
-        Connecting --> Connected : socket open & channel subscribed
-        Connected --> Reconnecting : network drop / heartbeat timeout
-        Reconnecting --> Connected : reconnect success & sync
+        Connecting --> Connected : socket open & SUBSCRIBED
+        Connected --> Reconnecting : network drop / timeout / channel error
+        Reconnecting --> Connected : SUBSCRIBED & delta sync (lastSyncedAt watermark)
         Reconnecting --> Disconnected : max retries exceeded
     }
 
-    state "Message Lifecycle" as MessageLifecycle {
+    state "Per-Channel Composer Domain" as ComposerState {
         [*] --> Idle
-        Idle --> Composing : user types content / attaches file
-        Composing --> Sending : submit message / upload
-        Sending --> Sent : broadcast success & database insert
+        Idle --> Composing : typing message
+        Composing --> UploadingAttachments : asynchronous file upload (staged)
+        UploadingAttachments --> Composing : upload complete / remove attachment (storage cleanup)
+        Composing --> Sending : submit message
+    }
+
+    state "Persisted Message Entity Domain" as MessageLifecycle {
+        [*] --> QueuedOptimistic
+        QueuedOptimistic --> Sending : generate UUID & DB insert
+        Sending --> Sent : database insert & realtime fanout reconciliation
+        Sending --> SendFailed : DB insert error
+        SendFailed --> Sending : user click retry
         Sent --> Edited : modify message content
-        Edited --> Sent : save update timestamp
-        Sent --> Deleted : remove message (cascades threads/reactions)
-        Deleted --> [*]
+        Edited --> Sent : update timestamp
+        Sent --> SoftDeleted : delete message with active thread replies (tombstone)
+        Sent --> HardDeleted : delete message with zero thread replies
+        SoftDeleted --> [*]
+        HardDeleted --> [*]
 
         state "Interactions" as SubInteractions {
             Sent --> ThreadActive : open thread panel & reply
             ThreadActive --> Sent : close thread panel
-            Sent --> Reacted : toggle emoji reaction
+            Sent --> Reacted : atomic reaction upsert/delete & rollback
         }
     }
 
     Authenticated --> ActiveWorkspace
     ActiveWorkspace --> Idle : channel loaded & subscribed
 ```
+
 
 ---
 

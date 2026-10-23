@@ -3,8 +3,8 @@ import { ChannelSubscriptionOptions, RealtimeSubscriptionHandle, RealtimeStatus,
 
 export class RealtimeService {
   /**
-   * Subscribe to a Supabase Realtime channel for Broadcast and Presence.
-   * Enforces error handling, status tracking, and reconnection reconciliation hooks.
+   * Subscribe to a Supabase Realtime channel for Broadcast, Presence, and Postgres Changes.
+   * Enforces error handling, status tracking, delta sync reconciliation, and reconnection watermarking.
    */
   public static subscribeToChannel(options: ChannelSubscriptionOptions): RealtimeSubscriptionHandle {
     const {
@@ -12,6 +12,9 @@ export class RealtimeService {
       workspaceId,
       user,
       onBroadcast,
+      onMessageChange,
+      onReactionChange,
+      onReconnect,
       onPresenceSync,
       onPresenceJoin,
       onPresenceLeave,
@@ -21,6 +24,8 @@ export class RealtimeService {
     const topicName = workspaceId 
       ? `workspace:${workspaceId}:channel:${channelId}` 
       : `channel:${channelId}`;
+
+    let lastSyncedAt = new Date().toISOString();
 
     const channel = supabase.channel(topicName, {
       config: {
@@ -38,6 +43,55 @@ export class RealtimeService {
           console.error(`Error in broadcast handler for channel ${channelId}:`, err);
         }
       });
+    }
+
+    // Setup postgres_changes for messages
+    if (onMessageChange) {
+      channel.on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'messages',
+          filter: `channel_id=eq.${channelId}`,
+        },
+        (payload) => {
+          try {
+            lastSyncedAt = new Date().toISOString();
+            onMessageChange({
+              eventType: payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE',
+              new: payload.new,
+              old: payload.old,
+            });
+          } catch (err) {
+            console.error(`Error in message change listener for channel ${channelId}:`, err);
+          }
+        }
+      );
+    }
+
+    // Setup postgres_changes for reactions (via message relationship or table)
+    if (onReactionChange) {
+      channel.on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'reactions',
+        },
+        (payload) => {
+          try {
+            lastSyncedAt = new Date().toISOString();
+            onReactionChange({
+              eventType: payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE',
+              new: payload.new,
+              old: payload.old,
+            });
+          } catch (err) {
+            console.error(`Error in reaction change listener for channel ${channelId}:`, err);
+          }
+        }
+      );
     }
 
     // Setup presence listeners if provided
@@ -74,15 +128,32 @@ export class RealtimeService {
       }
     }
 
+    // Track previous status to detect Reconnecting -> Connected transitions
+    let previousStatus: RealtimeStatus | null = null;
+
     // Subscribe with status callback & error handling
     channel.subscribe(async (status, err) => {
       const typedStatus = status as RealtimeStatus;
+      
+      if (previousStatus && (previousStatus === 'TIMED_OUT' || previousStatus === 'CLOSED' || previousStatus === 'CHANNEL_ERROR') && typedStatus === 'SUBSCRIBED') {
+        // Reconnected! Trigger delta sync reconciliation
+        if (onReconnect) {
+          try {
+            onReconnect(lastSyncedAt);
+          } catch (reconnectErr) {
+            console.error(`Error during delta sync reconciliation on reconnect for channel ${channelId}:`, reconnectErr);
+          }
+        }
+      }
+
+      previousStatus = typedStatus;
+
       if (onStatusChange) {
         onStatusChange(typedStatus, err ? new Error(err.message || String(err)) : undefined);
       }
 
       if (status === 'SUBSCRIBED') {
-        // Track initial presence if user is provided
+        lastSyncedAt = new Date().toISOString();
         if (user) {
           try {
             await channel.track({

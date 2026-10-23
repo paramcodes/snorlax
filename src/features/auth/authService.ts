@@ -1,6 +1,6 @@
 import { supabase } from '../../shared/supabase/client';
 import { User } from '../../types';
-import type { Session } from '@supabase/supabase-js';
+import type { Session, AuthChangeEvent } from '@supabase/supabase-js';
 
 export const authService = {
   async signUp(email: string, password: string, displayName: string) {
@@ -17,7 +17,6 @@ export const authService = {
     if (error) throw error;
 
     if (data.user) {
-      // Upsert profile record
       const { error: profileError } = await supabase.from('profiles').upsert({
         id: data.user.id,
         email: data.user.email || email,
@@ -84,9 +83,9 @@ export const authService = {
     if (error) throw error;
   },
 
-  onAuthStateChange(callback: (session: Session | null) => void) {
-    return supabase.auth.onAuthStateChange((_event, session) => {
-      callback(session);
+  onAuthStateChange(callback: (event: AuthChangeEvent, session: Session | null) => void) {
+    return supabase.auth.onAuthStateChange((event, session) => {
+      callback(event, session);
     });
   },
 };

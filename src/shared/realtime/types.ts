@@ -26,6 +26,9 @@ export interface ChannelSubscriptionOptions {
     [key: string]: unknown;
   };
   onBroadcast?: (event: string, payload: unknown) => void;
+  onMessageChange?: (payload: { eventType: 'INSERT' | 'UPDATE' | 'DELETE'; new: any; old: any }) => void;
+  onReactionChange?: (payload: { eventType: 'INSERT' | 'UPDATE' | 'DELETE'; new: any; old: any }) => void;
+  onReconnect?: (lastSyncedAt: string) => void;
   onPresenceSync?: (presenceState: PresenceState) => void;
   onPresenceJoin?: (key: string, currentPresence: unknown, newPresence: unknown) => void;
   onPresenceLeave?: (key: string, currentPresence: unknown, leftPresence: unknown) => void;

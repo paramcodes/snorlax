@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { User } from '../../types';
 import { authService } from './authService';
+import { supabase } from '../../shared/supabase/client';
+import { workspaceService } from '../workspaces/workspaceService';
 import type { Session } from '@supabase/supabase-js';
 
 export function useAuth() {
@@ -19,6 +21,37 @@ export function useAuth() {
     }
   }, []);
 
+  // Capture invite token from URL into sessionStorage on mount
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const inviteToken = params.get('invite') || params.get('invite_token');
+      if (inviteToken) {
+        sessionStorage.setItem('pending_invite_token', inviteToken);
+      }
+    } catch (err) {
+      console.error('Failed to capture invite token from URL:', err);
+    }
+  }, []);
+
+  // Check and consume pending invite token if user session is active
+  useEffect(() => {
+    async function consumeInviteIfAny(userId: string) {
+      const token = sessionStorage.getItem('pending_invite_token');
+      if (!token) return;
+      try {
+        await workspaceService.joinWorkspaceByInvite(token, userId);
+        sessionStorage.removeItem('pending_invite_token');
+      } catch (err) {
+        console.error('Failed to consume pending workspace invite:', err);
+      }
+    }
+
+    if (session?.user?.id) {
+      consumeInviteIfAny(session.user.id);
+    }
+  }, [session]);
+
   useEffect(() => {
     let mounted = true;
 
@@ -28,6 +61,13 @@ export function useAuth() {
         if (!mounted) return;
         setSession(currentSession);
         if (currentSession?.user) {
+          if (currentSession.access_token) {
+            try {
+              supabase.realtime.setAuth(currentSession.access_token);
+            } catch (realtimeAuthErr) {
+              console.error('Failed to set realtime auth token on init:', realtimeAuthErr);
+            }
+          }
           await fetchProfile(currentSession.user.id);
         } else {
           setUser(null);
@@ -44,10 +84,31 @@ export function useAuth() {
 
     initAuth();
 
-    const { data: subscription } = authService.onAuthStateChange(async (newSession) => {
+    const { data: subscription } = authService.onAuthStateChange(async (event, newSession) => {
       if (!mounted) return;
+
+      if (event === 'TOKEN_REFRESHED' && newSession) {
+        // Silent JWT refresh: update session without unmounting state or clearing drafts
+        setSession(newSession);
+        if (newSession.access_token) {
+          try {
+            supabase.realtime.setAuth(newSession.access_token);
+          } catch (realtimeAuthErr) {
+            console.error('Failed to set realtime auth on token refresh:', realtimeAuthErr);
+          }
+        }
+        return;
+      }
+
       setSession(newSession);
       if (newSession?.user) {
+        if (newSession.access_token) {
+          try {
+            supabase.realtime.setAuth(newSession.access_token);
+          } catch (realtimeAuthErr) {
+            console.error('Failed to set realtime auth on auth change:', realtimeAuthErr);
+          }
+        }
         await fetchProfile(newSession.user.id);
       } else {
         setUser(null);

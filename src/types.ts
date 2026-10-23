@@ -50,50 +50,9 @@ export interface Message {
   reactions: Reaction[];
   createdAt: string;
   editedAt?: string;
-}
-
-export interface Workspace {
-  id: string;
-  name: string;
-  slug: string;
-  ownerId: string;
-}
-
-export interface Channel {
-  id: string;
-  workspaceId: string;
-  name: string;
-  topic?: string;
-  isPrivate: boolean;
-}
-
-export interface Reaction {
-  id: string;
-  messageId: string;
-  userId: string;
-  emoji: string;
-}
-
-export interface Attachment {
-  id: string;
-  fileName: string;
-  fileSize: number;
-  contentType: string;
-  url: string;
-}
-
-export interface Message {
-  id: string;
-  channelId: string;
-  userId: string;
-  userName: string;
-  userAvatar: string;
-  content: string;
-  parentId?: string; // for thread replies
-  attachments?: Attachment[];
-  reactions: Reaction[];
-  createdAt: string;
-  editedAt?: string;
+  deletedAt?: string;
+  updatedAt?: string;
+  status?: 'sending' | 'sent' | 'failed';
 }
 
 export interface WorkspaceMember {

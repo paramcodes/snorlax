@@ -2,9 +2,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useStore } from '../store/useStore';
 import { 
   Hash, Lock, Search, Users, Send, Paperclip, Smile, 
-  MessageSquare, MoreHorizontal, Edit2, Trash2, Check, X, Sparkles 
+  MessageSquare, Edit2, Trash2, Sparkles, AlertCircle, RefreshCw, X 
 } from 'lucide-react';
 import { Attachment } from '../types';
+import { useAttachmentUpload } from '../features/attachments/useAttachmentUpload';
+import { AttachmentService } from '../features/attachments/attachmentService';
 
 export const ChatArea: React.FC = () => {
   const { 
@@ -12,6 +14,7 @@ export const ChatArea: React.FC = () => {
     currentChannelId, 
     messages, 
     sendMessage, 
+    retrySendMessage,
     editMessage, 
     deleteMessage, 
     toggleReaction, 
@@ -27,7 +30,9 @@ export const ChatArea: React.FC = () => {
   const [showEmojiPickerFor, setShowEmojiPickerFor] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   
+  const { upload, uploading, progress, error: uploadError } = useAttachmentUpload();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const currentChannel = channels.find(c => c.id === currentChannelId);
   const channelMessages = messages.filter(m => m.channelId === currentChannelId && !m.parentId);
@@ -36,23 +41,51 @@ export const ChatArea: React.FC = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [channelMessages.length]);
 
-  const handleSend = (e: React.FormEvent) => {
+  const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputContent.trim() && attachments.length === 0) return;
-    sendMessage(inputContent.trim(), attachments);
+    if ((!inputContent.trim() && attachments.length === 0) || uploading) return;
+
+    const contentToSend = inputContent;
+    const attachmentsToSend = [...attachments];
+
     setInputContent('');
     setAttachments([]);
+
+    await sendMessage(contentToSend, attachmentsToSend);
   };
 
-  const handleAttachMock = () => {
-    const mockFile: Attachment = {
-      id: `att-${Date.now()}`,
-      fileName: 'architecture-diagram.png',
-      fileSize: 245000,
-      contentType: 'image/png',
-      url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&h=400&fit=crop',
-    };
-    setAttachments([...attachments, mockFile]);
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    try {
+      const file = files[0];
+      const uploadedItem = await upload(file, { folder: `channel-${currentChannelId}` });
+      const newAttachment: Attachment = {
+        id: uploadedItem.id,
+        fileName: uploadedItem.fileName,
+        fileSize: uploadedItem.fileSize,
+        contentType: uploadedItem.contentType,
+        url: uploadedItem.url,
+      };
+      setAttachments(prev => [...prev, newAttachment]);
+    } catch (err) {
+      console.error('File upload failed:', err);
+    } finally {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
+  const handleRemoveAttachment = async (att: Attachment) => {
+    setAttachments(prev => prev.filter(a => a.id !== att.id));
+    try {
+      // Clean up orphaned storage blob immediately
+      await AttachmentService.deleteFile(att.url.split('/').slice(-2).join('/'));
+    } catch (err) {
+      console.error('Failed to clean up storage blob on removal:', err);
+    }
   };
 
   const EMOJI_LIST = ['👍', '❤️', '🔥', '🎉', '🚀', '👀', '💯'];
@@ -111,9 +144,10 @@ export const ChatArea: React.FC = () => {
           const isMe = msg.userId === currentUser?.id;
           const isEditing = editingId === msg.id;
           const threadRepliesCount = messages.filter(m => m.parentId === msg.id).length;
+          const isSoftDeleted = Boolean(msg.deletedAt || (!msg.content && msg.deletedAt));
 
           return (
-            <div key={msg.id} className="flex gap-4 group hover:bg-[#222529]/30 p-2 rounded-xl transition-colors relative">
+            <div key={msg.id} className={`flex gap-4 group hover:bg-[#222529]/30 p-2 rounded-xl transition-colors relative ${msg.status === 'sending' ? 'opacity-70' : ''}`}>
               <img src={msg.userAvatar} alt="" className="w-10 h-10 rounded-xl object-cover shrink-0 mt-0.5" />
               <div className="flex-1 min-w-0">
                 <div className="flex items-baseline gap-2 mb-1">
@@ -122,9 +156,21 @@ export const ChatArea: React.FC = () => {
                     {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </span>
                   {msg.editedAt && <span className="text-[10px] text-gray-500 italic">(edited)</span>}
+                  {msg.status === 'sending' && <span className="text-[10px] text-brand-400 animate-pulse">sending...</span>}
+                  {msg.status === 'failed' && (
+                    <button 
+                      onClick={() => retrySendMessage(msg.id)}
+                      className="flex items-center gap-1 text-[10px] text-red-400 hover:text-red-300 font-semibold bg-red-500/10 px-2 py-0.5 rounded-md"
+                    >
+                      <AlertCircle className="w-3 h-3" />
+                      <span>Failed to send (Click to retry)</span>
+                    </button>
+                  )}
                 </div>
 
-                {isEditing ? (
+                {isSoftDeleted ? (
+                  <p className="text-gray-500 italic text-sm">This message was deleted</p>
+                ) : isEditing ? (
                   <div className="space-y-2 mt-1">
                     <textarea
                       value={editContent}
@@ -135,9 +181,9 @@ export const ChatArea: React.FC = () => {
                     />
                     <div className="flex gap-2">
                       <button
-                        onClick={() => {
+                        onClick={async () => {
                           if (editContent.trim()) {
-                            editMessage(msg.id, editContent.trim());
+                            await editMessage(msg.id, editContent.trim());
                             setEditingId(null);
                           }
                         }}
@@ -170,30 +216,32 @@ export const ChatArea: React.FC = () => {
                 )}
 
                 {/* Reactions */}
-                <div className="flex flex-wrap gap-1.5 mt-2">
-                  {Object.entries(
-                    msg.reactions.reduce((acc, r) => {
-                      acc[r.emoji] = (acc[r.emoji] || 0) + 1;
-                      return acc;
-                    }, {} as Record<string, number>)
-                  ).map(([emoji, count]) => {
-                    const reactedByMe = msg.reactions.some(r => r.userId === currentUser?.id && r.emoji === emoji);
-                    return (
-                      <button
-                        key={emoji}
-                        onClick={() => toggleReaction(msg.id, emoji)}
-                        className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
-                          reactedByMe 
-                            ? 'bg-brand-600/20 border-brand-500 text-brand-400' 
-                            : 'bg-[#222529] border-white/5 text-gray-300 hover:border-white/20'
-                        }`}
-                      >
-                        <span>{emoji}</span>
-                        <span className="text-[11px] font-semibold">{count}</span>
-                      </button>
-                    );
-                  })}
-                </div>
+                {!isSoftDeleted && (
+                  <div className="flex flex-wrap gap-1.5 mt-2">
+                    {Object.entries(
+                      msg.reactions.reduce((acc, r) => {
+                        acc[r.emoji] = (acc[r.emoji] || 0) + 1;
+                        return acc;
+                      }, {} as Record<string, number>)
+                    ).map(([emoji, count]) => {
+                      const reactedByMe = msg.reactions.some(r => r.userId === currentUser?.id && r.emoji === emoji);
+                      return (
+                        <button
+                          key={emoji}
+                          onClick={() => toggleReaction(msg.id, emoji)}
+                          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                            reactedByMe 
+                              ? 'bg-brand-600/20 border-brand-500 text-brand-400' 
+                              : 'bg-[#222529] border-white/5 text-gray-300 hover:border-white/20'
+                          }`}
+                        >
+                          <span>{emoji}</span>
+                          <span className="text-[11px] font-semibold">{count}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
 
                 {/* Thread summary */}
                 {threadRepliesCount > 0 && (
@@ -203,53 +251,55 @@ export const ChatArea: React.FC = () => {
                   >
                     <MessageSquare className="w-3.5 h-3.5" />
                     <span>{threadRepliesCount} {threadRepliesCount === 1 ? 'reply' : 'replies'}</span>
-                    <span className="text-gray-500 font-normal">Last reply recently</span>
+                    <span className="text-gray-500 font-normal">View thread</span>
                   </button>
                 )}
               </div>
 
               {/* Hover Actions Toolbar */}
-              <div className="absolute right-4 -top-3 hidden group-hover:flex items-center gap-1 bg-[#222529] border border-white/10 rounded-xl p-1 shadow-xl z-10">
-                <button
-                  onClick={() => toggleReaction(msg.id, '👍')}
-                  className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
-                  title="Quick Like"
-                >
-                  👍
-                </button>
-                <button
-                  onClick={() => setShowEmojiPickerFor(showEmojiPickerFor === msg.id ? null : msg.id)}
-                  className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
-                  title="Add Reaction"
-                >
-                  <Smile className="w-4 h-4" />
-                </button>
-                <button
-                  onClick={() => setCurrentThread(msg.id)}
-                  className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
-                  title="Reply in Thread"
-                >
-                  <MessageSquare className="w-4 h-4" />
-                </button>
-                {isMe && (
-                  <>
-                    <button
-                      onClick={() => { setEditingId(msg.id); setEditContent(msg.content); }}
-                      className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
-                      title="Edit Message"
-                    >
-                      <Edit2 className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      onClick={() => deleteMessage(msg.id)}
-                      className="p-1.5 hover:bg-red-500/20 rounded-lg text-red-400 hover:text-red-300 transition-colors"
-                      title="Delete Message"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </>
-                )}
-              </div>
+              {!isSoftDeleted && (
+                <div className="absolute right-4 -top-3 hidden group-hover:flex items-center gap-1 bg-[#222529] border border-white/10 rounded-xl p-1 shadow-xl z-10">
+                  <button
+                    onClick={() => toggleReaction(msg.id, '👍')}
+                    className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
+                    title="Quick Like"
+                  >
+                    👍
+                  </button>
+                  <button
+                    onClick={() => setShowEmojiPickerFor(showEmojiPickerFor === msg.id ? null : msg.id)}
+                    className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
+                    title="Add Reaction"
+                  >
+                    <Smile className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => setCurrentThread(msg.id)}
+                    className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
+                    title="Reply in Thread"
+                  >
+                    <MessageSquare className="w-4 h-4" />
+                  </button>
+                  {isMe && (
+                    <>
+                      <button
+                        onClick={() => { setEditingId(msg.id); setEditContent(msg.content); }}
+                        className="p-1.5 hover:bg-white/10 rounded-lg text-gray-300 hover:text-white transition-colors"
+                        title="Edit Message"
+                      >
+                        <Edit2 className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => deleteMessage(msg.id)}
+                        className="p-1.5 hover:bg-red-500/20 rounded-lg text-red-400 hover:text-red-300 transition-colors"
+                        title="Delete Message"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
 
               {/* Emoji Picker Popup */}
               {showEmojiPickerFor === msg.id && (
@@ -274,6 +324,29 @@ export const ChatArea: React.FC = () => {
       {/* Composer */}
       <div className="p-4 bg-[#1a1d21] border-t border-[#222529]">
         <form onSubmit={handleSend} className="bg-[#222529] border border-white/10 rounded-2xl p-3 shadow-lg focus-within:border-brand-500 transition-colors">
+          <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileSelect}
+            className="hidden"
+            accept="image/*,video/*,application/pdf,.txt,.md"
+          />
+
+          {uploading && (
+            <div className="mb-3 px-3 py-2 bg-brand-600/10 border border-brand-500/30 rounded-xl flex items-center justify-between text-xs text-brand-300">
+              <div className="flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                <span>Uploading attachment... {progress}%</span>
+              </div>
+            </div>
+          )}
+
+          {uploadError && (
+            <div className="mb-3 px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-xl text-xs text-red-400">
+              Upload error: {uploadError.message}
+            </div>
+          )}
+
           {attachments.length > 0 && (
             <div className="flex gap-2 mb-3 pb-3 border-b border-white/10 overflow-x-auto">
               {attachments.map(att => (
@@ -282,7 +355,7 @@ export const ChatArea: React.FC = () => {
                   <span className="text-xs text-white truncate max-w-[120px]">{att.fileName}</span>
                   <button
                     type="button"
-                    onClick={() => setAttachments(attachments.filter(a => a.id !== att.id))}
+                    onClick={() => handleRemoveAttachment(att)}
                     className="p-1 hover:bg-white/10 rounded-lg text-gray-400 hover:text-white"
                   >
                     <X className="w-3.5 h-3.5" />
@@ -310,8 +383,9 @@ export const ChatArea: React.FC = () => {
             <div className="flex items-center gap-1">
               <button
                 type="button"
-                onClick={handleAttachMock}
-                className="p-2 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-colors"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="p-2 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-colors disabled:opacity-40"
                 title="Attach file"
               >
                 <Paperclip className="w-4 h-4" />
@@ -327,7 +401,7 @@ export const ChatArea: React.FC = () => {
 
             <button
               type="submit"
-              disabled={!inputContent.trim() && attachments.length === 0}
+              disabled={(!inputContent.trim() && attachments.length === 0) || uploading}
               className="bg-brand-600 hover:bg-brand-500 disabled:opacity-40 disabled:hover:bg-brand-600 text-white px-4 py-2 rounded-xl text-xs font-semibold shadow-lg shadow-brand-600/30 transition-all flex items-center gap-1.5"
             >
               <span>Send</span>

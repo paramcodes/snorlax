@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { User, Workspace, Channel, Message, Reaction, Attachment } from '../types';
+import { supabase } from '../shared/supabase/client';
 
 interface AppState {
   currentUser: User | null;
@@ -26,12 +27,13 @@ interface AppState {
   setLoading: (loading: boolean) => void;
   setError: (error: boolean) => void;
   
-  createWorkspace: (name: string) => void;
-  createChannel: (name: string, topic: string, isPrivate: boolean) => void;
-  sendMessage: (content: string, attachments?: Attachment[], parentId?: string) => void;
-  editMessage: (messageId: string, newContent: string) => void;
-  deleteMessage: (messageId: string) => void;
-  toggleReaction: (messageId: string, emoji: string) => void;
+  createWorkspace: (name: string) => Promise<void>;
+  createChannel: (name: string, topic: string, isPrivate: boolean) => Promise<void>;
+  sendMessage: (content: string, attachments?: Attachment[], parentId?: string) => Promise<void>;
+  retrySendMessage: (messageId: string) => Promise<void>;
+  editMessage: (messageId: string, newContent: string) => Promise<void>;
+  deleteMessage: (messageId: string) => Promise<void>;
+  toggleReaction: (messageId: string, emoji: string) => Promise<void>;
   loginDemo: (userType: 'alex' | 'jordan') => void;
   logout: () => void;
 }
@@ -75,6 +77,7 @@ const INITIAL_MESSAGES: Message[] = [
     content: 'Welcome everyone to Snorlax! 🚀 Our secure team collaboration workspace is fully online.',
     reactions: [{ id: 'react-1', messageId: 'msg-1', userId: 'user-jordan', emoji: '🎉' }],
     createdAt: new Date(Date.now() - 3600000 * 3).toISOString(),
+    status: 'sent',
   },
   {
     id: 'msg-2',
@@ -85,6 +88,7 @@ const INITIAL_MESSAGES: Message[] = [
     content: 'Awesome! Loving the Duolingo green theme and fast browser experience. @alex let us ship the MVP!',
     reactions: [{ id: 'react-2', messageId: 'msg-2', userId: 'user-alex', emoji: '💯' }],
     createdAt: new Date(Date.now() - 3600000 * 2).toISOString(),
+    status: 'sent',
   },
   {
     id: 'msg-3',
@@ -95,6 +99,7 @@ const INITIAL_MESSAGES: Message[] = [
     content: 'Thread reply test here! Check out the replies below.',
     reactions: [],
     createdAt: new Date(Date.now() - 3600000).toISOString(),
+    status: 'sent',
   },
   {
     id: 'msg-thread-1',
@@ -106,6 +111,7 @@ const INITIAL_MESSAGES: Message[] = [
     parentId: 'msg-3',
     reactions: [{ id: 'react-3', messageId: 'msg-thread-1', userId: 'user-alex', emoji: '👍' }],
     createdAt: new Date(Date.now() - 1800000).toISOString(),
+    status: 'sent',
   },
   {
     id: 'msg-4',
@@ -116,6 +122,7 @@ const INITIAL_MESSAGES: Message[] = [
     content: 'Tailwind v4 tokens are configured and verified with agent-browser.',
     reactions: [{ id: 'react-4', messageId: 'msg-4', userId: 'user-alex', emoji: '🚀' }],
     createdAt: new Date(Date.now() - 900000).toISOString(),
+    status: 'sent',
   }
 ];
 
@@ -139,7 +146,6 @@ export const useStore = create<AppState>((set, get) => ({
     set({ currentWorkspaceId: workspaceId, currentChannelId: firstChan ? firstChan.id : null, currentThreadMessageId: null });
   },
   setChannel: (channelId) => {
-    // Clear unread count when switching to channel
     set(state => ({
       currentChannelId: channelId,
       currentThreadMessageId: null,
@@ -153,7 +159,7 @@ export const useStore = create<AppState>((set, get) => ({
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ hasError: error }),
 
-  createWorkspace: (name) => {
+  createWorkspace: async (name) => {
     const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
     const newWs: Workspace = { id: `ws-${Date.now()}`, name, slug, ownerId: get().currentUser?.id || 'user-alex' };
     const newChan: Channel = { id: `chan-${Date.now()}`, workspaceId: newWs.id, name: 'general', topic: 'Default workspace channel', isPrivate: false, unreadCount: 0, mentionCount: 0 };
@@ -165,7 +171,7 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
-  createChannel: (name, topic, isPrivate) => {
+  createChannel: async (name, topic, isPrivate) => {
     const wsId = get().currentWorkspaceId;
     if (!wsId) return;
     const cleanName = name.toLowerCase().replace(/[^a-z0-9-_]/g, '-');
@@ -177,13 +183,16 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
-  sendMessage: (content, attachments = [], parentId) => {
+  sendMessage: async (content, attachments = [], parentId) => {
     const user = get().currentUser;
     const chanId = get().currentChannelId;
     if (!user || !chanId || (!content.trim() && attachments.length === 0)) return;
 
-    const newMsg: Message = {
-      id: `msg-${Date.now()}`,
+    const messageId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+
+    const optimisticMsg: Message = {
+      id: messageId,
       channelId: chanId,
       userId: user.id,
       userName: user.displayName,
@@ -192,40 +201,181 @@ export const useStore = create<AppState>((set, get) => ({
       parentId,
       attachments,
       reactions: [],
-      createdAt: new Date().toISOString(),
+      createdAt,
+      status: 'sending',
     };
 
-    set(state => ({ messages: [...state.messages, newMsg] }));
+    // Optimistic insert
+    set(state => ({ messages: [...state.messages, optimisticMsg] }));
+
+    try {
+      // 1. Insert message into DB
+      const { error: insertError } = await supabase.from('messages').insert({
+        id: messageId,
+        channel_id: chanId,
+        user_id: user.id,
+        content,
+        parent_id: parentId || null,
+      });
+
+      if (insertError) throw insertError;
+
+      // 2. Insert attachments if any
+      if (attachments.length > 0) {
+        const attachmentRows = attachments.map(att => ({
+          id: att.id,
+          message_id: messageId,
+          file_path: att.url, // Stored path/url
+          file_name: att.fileName,
+          file_size: att.fileSize,
+          content_type: att.contentType,
+        }));
+
+        const { error: attError } = await supabase.from('attachments').insert(attachmentRows);
+        if (attError) {
+          console.error('Failed to insert attachment records:', attError);
+        }
+      }
+
+      // Mark as sent
+      set(state => ({
+        messages: state.messages.map(m => m.id === messageId ? { ...m, status: 'sent' } : m)
+      }));
+    } catch (err) {
+      console.error('Failed to send message:', err);
+      set(state => ({
+        messages: state.messages.map(m => m.id === messageId ? { ...m, status: 'failed' } : m)
+      }));
+    }
   },
 
-  editMessage: (messageId, newContent) => {
+  retrySendMessage: async (messageId) => {
+    const msg = get().messages.find(m => m.id === messageId);
+    if (!msg || msg.status !== 'failed') return;
+
     set(state => ({
-      messages: state.messages.map(m => m.id === messageId ? { ...m, content: newContent, editedAt: new Date().toISOString() } : m)
+      messages: state.messages.map(m => m.id === messageId ? { ...m, status: 'sending' } : m)
     }));
+
+    try {
+      const { error: insertError } = await supabase.from('messages').insert({
+        id: messageId,
+        channel_id: msg.channelId,
+        user_id: msg.userId,
+        content: msg.content,
+        parent_id: msg.parentId || null,
+      });
+
+      if (insertError) throw insertError;
+
+      set(state => ({
+        messages: state.messages.map(m => m.id === messageId ? { ...m, status: 'sent' } : m)
+      }));
+    } catch (err) {
+      console.error('Retry send failed:', err);
+      set(state => ({
+        messages: state.messages.map(m => m.id === messageId ? { ...m, status: 'failed' } : m)
+      }));
+    }
   },
 
-  deleteMessage: (messageId) => {
+  editMessage: async (messageId, newContent) => {
+    const editedAt = new Date().toISOString();
+    // Optimistic update
     set(state => ({
-      messages: state.messages.filter(m => m.id !== messageId && m.parentId !== messageId)
+      messages: state.messages.map(m => m.id === messageId ? { ...m, content: newContent, editedAt, updatedAt: editedAt } : m)
     }));
+
+    try {
+      const { error } = await supabase
+        .from('messages')
+        .update({ content: newContent, edited_at: editedAt, updated_at: editedAt })
+        .eq('id', messageId);
+
+      if (error) throw error;
+    } catch (err) {
+      console.error('Failed to update message in DB:', err);
+    }
   },
 
-  toggleReaction: (messageId, emoji) => {
+  deleteMessage: async (messageId) => {
+    const state = get();
+    const hasChildReplies = state.messages.some(m => m.parentId === messageId);
+
+    if (hasChildReplies) {
+      // Hybrid soft delete: parent has thread replies, keep row as tombstone
+      const deletedAt = new Date().toISOString();
+      set(state => ({
+        messages: state.messages.map(m => m.id === messageId ? { ...m, content: '', deletedAt, updatedAt: deletedAt, attachments: [] } : m)
+      }));
+
+      try {
+        await supabase
+          .from('messages')
+          .update({ deleted_at: deletedAt, content: '', updated_at: deletedAt })
+          .eq('id', messageId);
+      } catch (err) {
+        console.error('Failed to soft delete message in DB:', err);
+      }
+    } else {
+      // Hard delete if zero thread replies
+      set(state => ({
+        messages: state.messages.filter(m => m.id !== messageId)
+      }));
+
+      try {
+        await supabase.from('messages').delete().eq('id', messageId);
+      } catch (err) {
+        console.error('Failed to hard delete message in DB:', err);
+      }
+    }
+  },
+
+  toggleReaction: async (messageId, emoji) => {
     const user = get().currentUser;
     if (!user) return;
+
+    const message = get().messages.find(m => m.id === messageId);
+    if (!message) return;
+
+    const existing = message.reactions.find(r => r.userId === user.id && r.emoji === emoji);
+
+    // Optimistic update
+    let updatedReactions;
+    if (existing) {
+      updatedReactions = message.reactions.filter(r => !(r.userId === user.id && r.emoji === emoji));
+    } else {
+      updatedReactions = [...message.reactions, { id: `react-${Date.now()}`, messageId, userId: user.id, emoji }];
+    }
+
     set(state => ({
-      messages: state.messages.map(msg => {
-        if (msg.id !== messageId) return msg;
-        const existing = msg.reactions.find(r => r.userId === user.id && r.emoji === emoji);
-        let updatedReactions;
-        if (existing) {
-          updatedReactions = msg.reactions.filter(r => !(r.userId === user.id && r.emoji === emoji));
-        } else {
-          updatedReactions = [...msg.reactions, { id: `react-${Date.now()}`, messageId, userId: user.id, emoji }];
-        }
-        return { ...msg, reactions: updatedReactions };
-      })
+      messages: state.messages.map(msg => msg.id === messageId ? { ...msg, reactions: updatedReactions } : msg)
     }));
+
+    try {
+      if (existing) {
+        await supabase
+          .from('reactions')
+          .delete()
+          .eq('message_id', messageId)
+          .eq('user_id', user.id)
+          .eq('emoji', emoji);
+      } else {
+        await supabase
+          .from('reactions')
+          .insert({
+            message_id: messageId,
+            user_id: user.id,
+            emoji,
+          });
+      }
+    } catch (err) {
+      console.error('Failed to persist reaction toggle:', err);
+      // Rollback on failure
+      set(state => ({
+        messages: state.messages.map(msg => msg.id === messageId ? { ...msg, reactions: message.reactions } : msg)
+      }));
+    }
   },
 
   loginDemo: (userType) => {
