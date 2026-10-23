@@ -34,6 +34,54 @@ Snorlax is a browser-first, Slack-inspired team collaboration app built with an 
 ![Snorlax Demo](./demo.gif)
 
 ---
+## 🗺️ System State Architecture
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unauthenticated
+
+    state "Authentication & Workspace" as AuthWorkspace {
+        Unauthenticated --> Authenticating : sign in / sign up
+        Authenticating --> Authenticated : session established
+        Authenticated --> Unauthenticated : sign out / token expired
+
+        [*] --> SelectWorkspace
+        SelectWorkspace --> ActiveWorkspace : select workspace / invite token
+        ActiveWorkspace --> SelectChannel : choose channel (public/private)
+    }
+
+    state "Realtime Connection" as RealtimeState {
+        [*] --> Disconnected
+        Disconnected --> Connecting : initialize Supabase client
+        Connecting --> Connected : socket open & channel subscribed
+        Connected --> Reconnecting : network drop / heartbeat timeout
+        Reconnecting --> Connected : reconnect success & sync
+        Reconnecting --> Disconnected : max retries exceeded
+    }
+
+    state "Message Lifecycle" as MessageLifecycle {
+        [*] --> Idle
+        Idle --> Composing : user types content / attaches file
+        Composing --> Sending : submit message / upload
+        Sending --> Sent : broadcast success & database insert
+        Sent --> Edited : modify message content
+        Edited --> Sent : save update timestamp
+        Sent --> Deleted : remove message (cascades threads/reactions)
+        Deleted --> [*]
+
+        state "Interactions" as SubInteractions {
+            Sent --> ThreadActive : open thread panel & reply
+            ThreadActive --> Sent : close thread panel
+            Sent --> Reacted : toggle emoji reaction
+        }
+    }
+
+    Authenticated --> ActiveWorkspace
+    ActiveWorkspace --> Idle : channel loaded & subscribed
+```
+
+---
+
 
 ## 🚀 Getting Started & Verification
 
